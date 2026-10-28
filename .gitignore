@@ -1,0 +1,19 @@
+# Compiled files
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.a
+*.dylib
+*.so
+*.app/
+
+# Debugger output
+*.log
+
+# macOS Finder metadata
+.DS_Store
+
+# Build output
+/build/

@@ -1,0 +1,7 @@
+
+Make GUI Better in general
+Make icon show up in audio midi preferenes
+Maybe add master graphic eq
+Make stereo balence controls for each output
+Automaticly set the final destination volumemes to max (so like turn the headphones out to max so it does not affect the mix)
+Make the audio device dissapear when the app is not running so that the defualt output is restored
