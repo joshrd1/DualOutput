@@ -10,6 +10,8 @@
     <string>com.dualoutput.driver</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>DeviceIcon</string>
     <key>CFBundleName</key>
     <string>Dual Output</string>
     <key>CFBundlePackageType</key>

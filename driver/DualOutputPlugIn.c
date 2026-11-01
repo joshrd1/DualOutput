@@ -9,19 +9,35 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <errno.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <math.h>
 
 #define kDeviceName                  "Dual Output"
 #define kManufacturerName            "DualOutput Audio"
+#define kDriverBundleIdentifier      "com.dualoutput.driver"
 #define kDeviceUID                   "com.dualoutput.driver.device"
 #define kModelUID                    "com.dualoutput.driver.model"
+#define kDeviceIconResourceName      "DeviceIcon"
+/* A controller-only plug-in property used to publish or withdraw the virtual
+ * device from Core Audio's device list. */
+#define kDualOutputPlugInPropertyDevicePresence 'dopr'
+
+static const AudioServerPlugInCustomPropertyInfo kPlugInCustomProperties[] = {
+    {
+        kDualOutputPlugInPropertyDevicePresence,
+        kAudioServerPlugInCustomPropertyDataTypeCFPropertyList,
+        kAudioServerPlugInCustomPropertyDataTypeNone
+    }
+};
 
 #define kChannelCount                2
 #define kBytesPerSample              4
@@ -53,6 +69,12 @@ static const Float64 kSupportedSampleRates[] = {
 static pthread_mutex_t              gStateMutex = PTHREAD_MUTEX_INITIALIZER;
 static AudioServerPlugInHostRef     gPlugInHost = NULL;
 static _Atomic UInt32               gRefCount = 0;
+/* Cached from the plug-in bundle and retained for the driver's lifetime. */
+static CFURLRef                     gDeviceIconURL = NULL;
+/* The PID of the controller currently publishing this device, or zero while
+ * the controller is not running. */
+static _Atomic pid_t                gControllerProcessID = 0;
+static _Atomic bool                 gPresenceWatchdogStarted = false;
 
 static Float64                      gSampleRate = 48000.0;
 static UInt32                       gIOClientCount = 0;
@@ -144,6 +166,71 @@ static UInt32 GetControlElementForVolumeObject(AudioObjectID inObjectID) {
         case kObjectID_Volume_Output_Right:  return 2;
         default:                             return kAudioObjectPropertyElementMain;
     }
+}
+
+static Boolean DeviceIsPublished(void) {
+    return atomic_load_explicit(&gControllerProcessID, memory_order_acquire) > 0;
+}
+
+static void NotifyDevicePresenceChanged(void) {
+    if (gPlugInHost == NULL) return;
+
+    AudioObjectPropertyAddress plugInChanges[] = {
+        { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+    };
+    gPlugInHost->PropertiesChanged(gPlugInHost, kObjectID_PlugIn, 2, plugInChanges);
+
+    /* This covers clients that still hold the former device object while the
+     * HAL processes the plug-in's changed device list. */
+    AudioObjectPropertyAddress deviceChanges[] = {
+        { kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyIsHidden, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+    };
+    gPlugInHost->PropertiesChanged(gPlugInHost, kObjectID_Device, 2, deviceChanges);
+}
+
+/* The normal controller termination path withdraws the device synchronously.
+ * This watchdog covers crashes or forced termination so the endpoint cannot
+ * remain published after its owning process is gone. */
+static void *DevicePresenceWatchdogMain(void *context) {
+    (void)context;
+    for (;;) {
+        sleep(1);
+        pid_t controllerPID = atomic_load_explicit(&gControllerProcessID, memory_order_acquire);
+        if (controllerPID <= 0) continue;
+        if (kill(controllerPID, 0) == 0) continue;
+        if (errno != ESRCH) continue;
+
+        pid_t expectedPID = controllerPID;
+        if (atomic_compare_exchange_strong_explicit(&gControllerProcessID,
+                                                    &expectedPID,
+                                                    0,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            NotifyDevicePresenceChanged();
+        }
+    }
+    return NULL;
+}
+
+/* Audio MIDI Setup asks the device for kAudioDevicePropertyIcon. The property
+ * hands ownership to the caller, while the driver retains its cached resource
+ * URL so later requests never depend on a temporary bundle lookup. */
+static CFURLRef CopyDeviceIconURL(void) {
+    pthread_mutex_lock(&gStateMutex);
+    if (gDeviceIconURL == NULL) {
+        CFBundleRef driverBundle = CFBundleGetBundleWithIdentifier(CFSTR(kDriverBundleIdentifier));
+        if (driverBundle != NULL) {
+            gDeviceIconURL = CFBundleCopyResourceURL(driverBundle,
+                                                      CFSTR(kDeviceIconResourceName),
+                                                      CFSTR("png"),
+                                                      NULL);
+        }
+    }
+    CFURLRef iconURL = (gDeviceIconURL != NULL) ? (CFURLRef)CFRetain(gDeviceIconURL) : NULL;
+    pthread_mutex_unlock(&gStateMutex);
+    return iconURL;
 }
 
 /* Forward declarations */
@@ -252,6 +339,15 @@ static OSStatus DualOutput_Initialize(AudioServerPlugInDriverRef inDriver, Audio
     RecalculateClockParameters();
     memset(gRingBuffer, 0, sizeof(gRingBuffer));
     atomic_store(&gLastWrittenSampleEnd, -1);
+
+    if (!atomic_exchange_explicit(&gPresenceWatchdogStarted, true, memory_order_acq_rel)) {
+        pthread_t watchdogThread;
+        if (pthread_create(&watchdogThread, NULL, DevicePresenceWatchdogMain, NULL) == 0) {
+            pthread_detach(watchdogThread);
+        } else {
+            atomic_store_explicit(&gPresenceWatchdogStarted, false, memory_order_release);
+        }
+    }
     pthread_mutex_unlock(&gStateMutex);
     return kAudioHardwareNoError;
 }
@@ -324,10 +420,13 @@ static Boolean DualOutput_HasProperty(AudioServerPlugInDriverRef inDriver, Audio
                 case kAudioObjectPropertyOwner:
                 case kAudioObjectPropertyManufacturer:
                 case kAudioObjectPropertyOwnedObjects:
+                case kAudioObjectPropertyCustomPropertyInfoList:
+                case kAudioPlugInPropertyBundleID:
                 case kAudioPlugInPropertyBoxList:
                 case kAudioPlugInPropertyTranslateUIDToDevice:
                 case kAudioPlugInPropertyDeviceList:
                 case kAudioPlugInPropertyResourceBundle:
+                case kDualOutputPlugInPropertyDevicePresence:
                     return true;
                 default:
                     return false;
@@ -355,6 +454,7 @@ static Boolean DualOutput_HasProperty(AudioServerPlugInDriverRef inDriver, Audio
                 case kAudioDevicePropertySafetyOffset:
                 case kAudioDevicePropertyNominalSampleRate:
                 case kAudioDevicePropertyAvailableNominalSampleRates:
+                case kAudioDevicePropertyIcon:
                 case kAudioDevicePropertyIsHidden:
                 case kAudioDevicePropertyPreferredChannelsForStereo:
                 case kAudioDevicePropertyPreferredChannelLayout:
@@ -441,6 +541,11 @@ static OSStatus DualOutput_IsPropertySettable(AudioServerPlugInDriverRef inDrive
     }
     *outIsSettable = false;
     switch (inObjectID) {
+        case kObjectID_PlugIn:
+            if (inAddress->mSelector == kDualOutputPlugInPropertyDevicePresence) {
+                *outIsSettable = true;
+            }
+            break;
         case kObjectID_Device:
             if (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate) {
                 *outIsSettable = true;
@@ -494,17 +599,28 @@ static OSStatus DualOutput_GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
                 case kAudioObjectPropertyOwner:
+                    *outDataSize = sizeof(AudioObjectID);
+                    return kAudioHardwareNoError;
+                case kAudioObjectPropertyCustomPropertyInfoList:
+                    *outDataSize = sizeof(kPlugInCustomProperties);
+                    return kAudioHardwareNoError;
                 case kAudioObjectPropertyOwnedObjects:
-                case kAudioPlugInPropertyTranslateUIDToDevice:
                 case kAudioPlugInPropertyDeviceList:
+                    *outDataSize = DeviceIsPublished() ? sizeof(AudioObjectID) : 0;
+                    return kAudioHardwareNoError;
+                case kAudioPlugInPropertyTranslateUIDToDevice:
                     *outDataSize = sizeof(AudioObjectID);
                     return kAudioHardwareNoError;
                 case kAudioPlugInPropertyBoxList:
                     *outDataSize = 0;
                     return kAudioHardwareNoError;
                 case kAudioObjectPropertyManufacturer:
+                case kAudioPlugInPropertyBundleID:
                 case kAudioPlugInPropertyResourceBundle:
                     *outDataSize = sizeof(CFStringRef);
+                    return kAudioHardwareNoError;
+                case kDualOutputPlugInPropertyDevicePresence:
+                    *outDataSize = sizeof(CFPropertyListRef);
                     return kAudioHardwareNoError;
                 default:
                     return kAudioHardwareUnknownPropertyError;
@@ -523,6 +639,9 @@ static OSStatus DualOutput_GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
                 case kAudioDevicePropertyDeviceUID:
                 case kAudioDevicePropertyModelUID:
                     *outDataSize = sizeof(CFStringRef);
+                    return kAudioHardwareNoError;
+                case kAudioDevicePropertyIcon:
+                    *outDataSize = sizeof(CFURLRef);
                     return kAudioHardwareNoError;
                 case kAudioObjectPropertyOwnedObjects:
                     if (inAddress->mScope == kAudioObjectPropertyScopeGlobal) {
@@ -710,13 +829,27 @@ static OSStatus DualOutput_GetPropertyData(AudioServerPlugInDriverRef inDriver, 
                     *((AudioObjectID *)outData) = kAudioObjectUnknown;
                     *outDataSize = sizeof(AudioObjectID);
                     return kAudioHardwareNoError;
+                case kAudioObjectPropertyCustomPropertyInfoList:
+                    if (inDataSize < sizeof(kPlugInCustomProperties)) return kAudioHardwareBadPropertySizeError;
+                    memcpy(outData, kPlugInCustomProperties, sizeof(kPlugInCustomProperties));
+                    *outDataSize = sizeof(kPlugInCustomProperties);
+                    return kAudioHardwareNoError;
                 case kAudioObjectPropertyManufacturer:
                     if (inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                     *((CFStringRef *)outData) = CFSTR(kManufacturerName);
                     *outDataSize = sizeof(CFStringRef);
                     return kAudioHardwareNoError;
+                case kAudioPlugInPropertyBundleID:
+                    if (inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                    *((CFStringRef *)outData) = CFSTR(kDriverBundleIdentifier);
+                    *outDataSize = sizeof(CFStringRef);
+                    return kAudioHardwareNoError;
                 case kAudioObjectPropertyOwnedObjects:
                 case kAudioPlugInPropertyDeviceList:
+                    if (!DeviceIsPublished()) {
+                        *outDataSize = 0;
+                        return kAudioHardwareNoError;
+                    }
                     if (inDataSize < sizeof(AudioObjectID)) {
                         *outDataSize = 0;
                         return kAudioHardwareNoError;
@@ -732,7 +865,7 @@ static OSStatus DualOutput_GetPropertyData(AudioServerPlugInDriverRef inDriver, 
                         return kAudioHardwareBadPropertySizeError;
                     }
                     CFStringRef uid = *((const CFStringRef *)inQualifierData);
-                    if (uid != NULL && CFEqual(uid, CFSTR(kDeviceUID))) {
+                    if (DeviceIsPublished() && uid != NULL && CFEqual(uid, CFSTR(kDeviceUID))) {
                         *((AudioObjectID *)outData) = kObjectID_Device;
                     } else {
                         *((AudioObjectID *)outData) = kAudioObjectUnknown;
@@ -744,6 +877,11 @@ static OSStatus DualOutput_GetPropertyData(AudioServerPlugInDriverRef inDriver, 
                     if (inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                     *((CFStringRef *)outData) = CFSTR("");
                     *outDataSize = sizeof(CFStringRef);
+                    return kAudioHardwareNoError;
+                case kDualOutputPlugInPropertyDevicePresence:
+                    if (inDataSize < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
+                    *((CFPropertyListRef *)outData) = CFRetain(DeviceIsPublished() ? kCFBooleanTrue : kCFBooleanFalse);
+                    *outDataSize = sizeof(CFPropertyListRef);
                     return kAudioHardwareNoError;
                 default:
                     return kAudioHardwareUnknownPropertyError;
@@ -786,6 +924,14 @@ static OSStatus DualOutput_GetPropertyData(AudioServerPlugInDriverRef inDriver, 
                     *((CFStringRef *)outData) = CFSTR(kModelUID);
                     *outDataSize = sizeof(CFStringRef);
                     return kAudioHardwareNoError;
+                case kAudioDevicePropertyIcon: {
+                    if (inDataSize < sizeof(CFURLRef)) return kAudioHardwareBadPropertySizeError;
+                    CFURLRef iconURL = CopyDeviceIconURL();
+                    if (iconURL == NULL) return kAudioHardwareUnspecifiedError;
+                    *((CFURLRef *)outData) = iconURL;
+                    *outDataSize = sizeof(CFURLRef);
+                    return kAudioHardwareNoError;
+                }
                 case kAudioObjectPropertyOwnedObjects: {
                     AudioObjectID *list = (AudioObjectID *)outData;
                     UInt32 capacity = inDataSize / sizeof(AudioObjectID);
@@ -876,7 +1022,7 @@ static OSStatus DualOutput_GetPropertyData(AudioServerPlugInDriverRef inDriver, 
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyDeviceIsAlive:
                     if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-                    *((UInt32 *)outData) = 1;
+                    *((UInt32 *)outData) = DeviceIsPublished() ? 1 : 0;
                     *outDataSize = sizeof(UInt32);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyDeviceIsRunning:
@@ -893,9 +1039,13 @@ static OSStatus DualOutput_GetPropertyData(AudioServerPlugInDriverRef inDriver, 
                     *outDataSize = sizeof(UInt32);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyLatency:
-                case kAudioDevicePropertyIsHidden:
                     if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
                     *((UInt32 *)outData) = 0;
+                    *outDataSize = sizeof(UInt32);
+                    return kAudioHardwareNoError;
+                case kAudioDevicePropertyIsHidden:
+                    if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+                    *((UInt32 *)outData) = DeviceIsPublished() ? 0 : 1;
                     *outDataSize = sizeof(UInt32);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertySafetyOffset:
@@ -1178,6 +1328,31 @@ static OSStatus DualOutput_SetPropertyData(AudioServerPlugInDriverRef inDriver, 
     if (!settable) return kAudioHardwareIllegalOperationError;
 
     switch (inObjectID) {
+        case kObjectID_PlugIn:
+            if (inAddress->mSelector == kDualOutputPlugInPropertyDevicePresence) {
+                if (inDataSize < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
+                CFPropertyListRef propertyList = *((CFPropertyListRef const *)inData);
+                if (propertyList == NULL || CFGetTypeID(propertyList) != CFBooleanGetTypeID()) {
+                    return kAudioHardwareIllegalOperationError;
+                }
+                bool present = CFBooleanGetValue((CFBooleanRef)propertyList);
+                pid_t currentPID = atomic_load_explicit(&gControllerProcessID, memory_order_acquire);
+                pid_t newPID = currentPID;
+                if (present) {
+                    newPID = inClientProcessID;
+                } else if (currentPID == inClientProcessID) {
+                    newPID = 0;
+                }
+                if ((currentPID > 0) != (newPID > 0)) {
+                    atomic_store_explicit(&gControllerProcessID, newPID, memory_order_release);
+                    NotifyDevicePresenceChanged();
+                } else if (newPID != currentPID) {
+                    atomic_store_explicit(&gControllerProcessID, newPID, memory_order_release);
+                }
+                return kAudioHardwareNoError;
+            }
+            return kAudioHardwareUnknownPropertyError;
+
         case kObjectID_Device:
             if (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate) {
                 if (inDataSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;

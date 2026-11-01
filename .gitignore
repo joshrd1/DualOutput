@@ -15,5 +15,8 @@
 # macOS Finder metadata
 .DS_Store
 
+# Archives
+/Archives/
+
 # Build output
 /build/

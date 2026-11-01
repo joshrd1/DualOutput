@@ -22,6 +22,7 @@ echo "Using SDK:   ${SDK_PATH}"
 
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}/DualOutput.driver/Contents/MacOS"
+mkdir -p "${BUILD_DIR}/DualOutput.driver/Contents/Resources"
 mkdir -p "${BUILD_DIR}/DualOutput.app/Contents/MacOS"
 mkdir -p "${BUILD_DIR}/DualOutput.app/Contents/Resources"
 
@@ -38,6 +39,7 @@ clang \
 
 "${BUILD_DIR}/generate_icon" "${BUILD_DIR}/AppIcon.iconset"
 iconutil -c icns "${BUILD_DIR}/AppIcon.iconset" -o "${BUILD_DIR}/DualOutput.app/Contents/Resources/AppIcon.icns"
+cp "${BUILD_DIR}/AppIcon.iconset/icon_256x256.png" "${BUILD_DIR}/DualOutput.driver/Contents/Resources/DeviceIcon.png"
 rm -rf "${BUILD_DIR}/AppIcon.iconset" "${BUILD_DIR}/generate_icon"
 
 echo "=== Building DualOutput.driver (CoreAudio HAL AudioServerPlugIn) ==="
